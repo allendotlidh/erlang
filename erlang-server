@@ -1,0 +1,261 @@
+-module(test3_server).
+-export([listen_Traversal/0]).
+
+-include("msg_pb.hrl").
+
+-define(TcpOption,[binary,{active,false},{reuseaddr,true},{packet,1}]).
+-define(Port,888).
+%http://blog.csdn.net/hjhjava/article/details/17317099
+
+%%房主登录，刷新房间列表，创建房间，进入房间。
+%%退回房间列表，delete_room .点击back键，出发disconnect
+
+%%只有房主退出才会出发delete_room,由其他玩家代发
+%%非房主掉线触发exit_room，由房主代发
+listen_Traversal()->
+	
+	ets:new(room_data_sr, [duplicate_bag, public, named_table, {keypos, 1}]),
+	%get socket and userid and roomid
+	ets:new(socketdata, [duplicate_bag, public, named_table, {keypos, 1}]),
+
+	Pid=spawn(fun()->clientManager([]) end),
+	register(clientManagerPid,Pid),
+	{ok,ListenPort}=gen_tcp:listen(?Port,?TcpOption),
+	doAccept(ListenPort).
+
+
+doAccept(ListenPort)->
+	{ok,Socket}=gen_tcp:accept(ListenPort),
+	io:format("acceptSock Okay~n"),
+	clientManagerPid!{connect,Socket},
+	spawn(fun()->handleClient(Socket) end),	
+	doAccept(ListenPort).
+
+
+handleClient(Socket) ->
+case gen_tcp:recv(Socket,0) of
+{ok,Data}->
+	Time=calendar:local_time(),
+	io:format("~n>--------------------------------MSG START---------------------------------<"),
+	io:format(" ~p~n",[Time]),
+	io:format("<<data>>  receive data:~p~n",[Data]),
+	Msg=msg_pb:decode_msg(Data),
+	io:format("Server (unpacked)  ~p~n",[Msg]),
+	case Msg#msg.msg_label of 
+	"login"->
+		io:format("<-----------------------------------------------------login module---->~n"),
+		OnlinePeople=length(ets:match(socketdata,'$1')),
+		io:format("<<room_usr_num>>:~p~n",[OnlinePeople]), 	 %%%%%%%在线人数
+		case OnlinePeople<1000 of 
+		true->
+			Response="online_demo";
+		_->
+			Response="crowded"
+		end, 
+		Str=#msg{msg_label="login",msg_text=Response},	
+		Msg_reply=msg_pb:encode_msg(Str),
+    		clientManagerPid ! {data, Socket,Msg_reply,"someone"},
+		io:format("login positive~n~n~n"), 
+    		handleClient(Socket);
+	"refresh"->
+		io:format("<-------------------------------------------------refresh module---->~n"),
+		Room_info=ets:match_object(room_data_sr,{'_','_'}),     %%%%%房间列表数据
+    		case length(Room_info) of
+    			0->
+    		      		ok;
+    			_->	
+			    	%io:format("<<refresh_room>>:~p~n",[Room_info]),
+			    	clientManagerPid!{data,Socket,"RoomInfo",Room_info}
+    		end,
+		io:format("refresh positive~n~n~n"), 
+    		handleClient(Socket);
+        "in_room"->
+		io:format("<-------------------------------------------------in_room module---->~n"),
+		MsgTowho=Msg#msg.msg_who,
+    		Userid=Msg#msg.msgowner_id,
+		RoomOwner_id=Msg#msg.roomowner_id,
+		
+		Str=#msg{msg_label="say",towho=-1,msg_who=Msg#msg.msg_who,msgowner_id=RoomOwner_id,msg_text="HI~,初来乍到，求带！"},
+		%io:format("Socket~p userid:~p roomID:~p~n~n",[Socket,Userid,RoomOwner_id]),
+		case ets:lookup(socketdata,Socket) of
+			[]->
+   				ets:insert(socketdata,{Socket,Userid,RoomOwner_id}),
+				Socket_list=[Socket_id||{Socket_id,_,_}<-ets:match_object(socketdata,{'_','_',RoomOwner_id})],
+				Msg_reply=msg_pb:encode_msg(Str),
+                    		clientManagerPid ! {data, Socket_list,Msg_reply,"someone"};
+			_->
+				ok
+    		end,
+		
+		io:format("in_room positive~n~n~n"), 
+  		handleClient(Socket);
+    	"exit_room"->
+		io:format("<-----------------------------------------------exit_room module---->~n"),
+		MsgText=Msg#msg.msg_text,
+    		User_id=Msg#msg.msgowner_id,
+		Str=#msg	{msg_label="say",towho=Msg#msg.towho,msgowner_id=Msg#msg.msgowner_id,msg_who=Msg#msg.msg_who,msg_text=MsgText},				
+		case ets:match_object(socketdata,{'_',User_id,'_'}) of
+			[{Socket2,User_id1,RoomOwner_id}] when User_id1=:=RoomOwner_id ->		%room_owner out_room
+				io:format("~nRoomOwner_out by itself ~n~n"),
+				Socket_list=[Socket_id||{Socket_id,_,_}<-ets:match_object(socketdata,{'_','_',RoomOwner_id})],
+				
+				Msg_reply=msg_pb:encode_msg(Str),
+                    		clientManagerPid ! {data, Socket_list,Msg_reply,"someone"},
+				ets:delete(socketdata,Socket2),
+				ets:delete(room_data_sr,Socket2);
+               	 	[]->
+                    		io:format("<<INFO>>room_user offline before~n~n~n~n"),
+                    		ok;
+			[{Socket2,User_id1,RoomOwner_id}]->						%room_user out_room
+				Socket_list2=[Socket_id||{Socket_id,_,_}<-ets:match_object(socketdata,{'_','_',RoomOwner_id})],
+				Msg_reply=msg_pb:encode_msg(Str),
+                    		clientManagerPid ! {data, Socket_list2,Msg_reply,"someone"},
+				ets:delete(socketdata,Socket2)	
+		end,
+    		%io:format("<<out_room>> socket:~p leave room~n",[Socket]),
+		io:format("exit_room positive~n~n~n"), 
+            	handleClient(Socket);
+	"delete_room"->					%roomowner offline by accidant
+		io:format("<-------------------------------------------------delete_room module---->~n"),
+   
+		case ets:lookup(socketdata,Socket) of 
+			[{Socket,Userid,RoomOwner_id}] ->
+				case ets:match_object(socketdata,{'_',RoomOwner_id,'_'}) of
+				[{Socket2,_,_}]->
+					ets:delete(room_data_sr,Socket2);
+               	 		[]->
+                    			io:format("<<INFO>>roomowner offline before~n~n~n~n"),
+                    			ok
+				end;
+               	 	[]->
+                    		io:format("<<INFO>>say something but noboby hearing1~n"),
+                    		ok
+		end,
+		ets:delete(socketdata,Socket),
+    		%io:format("<<out_room>> socket:~p leave room~n",[Socket]),
+		io:format("delete_room positive~n~n~n"), 
+            	handleClient(Socket);
+    	"create_room"->
+		io:format("<----------------------------------------------------create_room module---->~n"),
+		Msg_label=Msg#msg.msg_label,
+		Uid=Msg#msg.uid,
+		Head_path=Msg#msg.head_path,
+		RoomName=Msg#msg.roomname,
+		OwnerName=Msg#msg.ownername,
+		MaxPlayerCount=Msg#msg.maxplayercount,
+		ServerIP=Msg#msg.serverip,
+		ServerPort=Msg#msg.serverport,
+		%OnlineUserNum=Msg#msg.onlineusernum,
+		ets:insert(socketdata,{Socket,Uid,Uid}),	
+		
+    		ets:insert(room_data_sr,{Socket,Data}),
+		io:format("create_room positive~n~n~n"), 
+    		handleClient(Socket);
+    	"say"->		
+		io:format("<----------------------------------------------------------------say module---->~n"),
+ 		Towho=Msg#msg.towho,
+    		case Towho of
+    		1->%it is here all_public
+    			clientManagerPid!{data,Data,Socket};
+    		-1->% it is room_public
+                	case ets:lookup(socketdata,Socket) of
+               		[{Socket,Userid,RoomOwner_id}]->
+                    	Socket_list=[Socket_id||{Socket_id,_,_}<-ets:match_object(socketdata,{'_','_',RoomOwner_id})],
+			Socket_list2=lists:delete(Socket,Socket_list),
+                    	clientManagerPid ! {data, Socket_list2,Data,"someone"};
+               	 	[]->
+                    		io:format("<<INFO>>say something but noboby hearing1~n"),
+                    		ok
+                	end;
+		[]->
+                    	io:format("<<INFO>>say something but noboby hearing2~n"),
+                    	ok;
+    		_->		
+			io:format("~n"),
+                    	case ets:match_object(socketdata,{'_',Towho,'_'}) of
+				[{Socket2,_,_}]->
+					clientManagerPid!{data,Socket2,Data,"someone"};
+               	 		[]->
+                    		io:format("<<INFO>>say something but noboby hearing1~n"),
+                    		ok
+                	end
+    		end,
+		io:format("say positive~n~n~n"), 
+    		handleClient(Socket);
+    	_->
+    		io:format("wrong msg-style~n"),
+            	handleClient(Socket)
+        end;
+    {error, closed} ->
+        io:format("<<error>> error closed1~n"),
+        clientManagerPid ! {disconnect, Socket};
+   _->
+	io:format("ggggg~n")
+end.
+    
+clientManager(Sockets)->
+	receive
+		{connect,Socket}->
+			io:format("socket conneted:~w~n",[Socket]),
+			NewSockets=[Socket | Sockets];
+		{disconnect,Socket}->
+			io:format("socket disconnected:~w~n",[Socket]),
+			
+			ets:delete(socketdata,Socket),
+			ets:delete(room_data_sr,Socket),
+			NewSockets=lists:delete(Socket,Sockets);
+		{data,Data}->
+			send_data(Sockets,Data),
+			NewSockets=Sockets;
+		{data,Data,Socket}->
+			NewSockets=Sockets,
+			Socket1=lists:delete(Socket,Sockets),
+			send_data(Socket1,Data);	
+		{data,Socket_list,Data,"someone"}->	
+			%io:format("222222222222222~n"),
+			send_data(Socket_list,Data),
+			NewSockets=Sockets;
+		{data,Socket,"RoomInfo",Data}->
+			send_RoomInfo(Socket,Data),
+			NewSockets=Sockets
+	end,
+	clientManager(NewSockets).
+
+send_data(Sockets,Data)->
+	io:format("<<send_data>> Data:~p..SOck:~p...~n~n",[Data,Sockets]),
+	case is_list(Sockets) of
+		 true->
+			%io:format("33333~n"),
+			SendData=fun(Socket)->							
+				gen_tcp:send(Socket,Data)end,
+			lists:foreach(SendData,Sockets);
+		false->
+			%io:format("555~n"),
+			gen_tcp:send(Sockets,Data)
+	end.
+	
+send_RoomInfo(Socket,Room_info)->
+	SendSocket=fun(Msg)->
+			{Socket_id,Str}=Msg,
+			gen_tcp:send(Socket,Str),
+			io:format("<<send_RoomInfo>>  Data:~p..SOck:~p...~n",[Str,Socket])end,
+	lists:foreach(SendSocket,Room_info).
+
+    
+
+
+
+%below is nonsense,back to code above
+send_socket(Socket,Data)->
+	io:format("<<send_data>>  Data:~p..SOck:~p...~n",[Data,Socket]),
+	SendSocket=fun(Msg)->	%room_info得到的是tuple[{""},{""}]
+						{Msg_list}=Msg,
+                        			
+						Msg_binary=list_to_binary(Msg_list),
+						gen_tcp:send(Socket,Msg_binary),
+						io:format("<<send_data>>  Data:~p..SOck:~p...~n",[Msg_binary,Socket])end,
+	lists:foreach(SendSocket,Data).
+
+%%send_socket(Socket,Room_infos);  Room_info is [{""},{""}]  
+%%send_data(Sockets,Data);  Data is [{""},{""}]  
+
