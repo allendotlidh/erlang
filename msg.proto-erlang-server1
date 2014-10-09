@@ -1,0 +1,23 @@
+package Msg;
+message Msg{
+	required string msg_label=1;
+	optional string socket=2;
+	optional int32 user_id=3;
+	optional int32 roomowner_id=4;
+
+	optional int32 uid=5;
+	optional string head_path=6;
+	optional string roomname=7;
+	optional string ownername=8;
+	optional int32 maxplayercount=9;
+	optional string serverip=10;
+	optional int32 serverport=11;
+	optional int32 onlineusernum=12;
+
+	optional int32 towho=13;
+	optional int32 msgowner_id=14;
+	optional string msg_who=15;
+	optional string msg_text=16;
+
+}
+
